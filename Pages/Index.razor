@@ -1,0 +1,693 @@
+﻿@page "/"
+@using System.Timers
+@using Majorsoft.Blazor.Components.Common.JsInterop.ElementInfo
+
+<svg width="1000" height="1000" style="background-color:#0094ff" @ref="MapReference" @onmousemove="MouseMove" @onmouseup="MouseUp">
+    @foreach (var tile in _map.Tiles)
+    {
+        <g transform="translate(@tile.X, @tile.Y)" @onmousedown:preventDefault @onmousedown="@(e => MapMouseDown(e, tile))" style="cursor:grab">
+            <polygon fill="@tile.PrimaryColor" stroke="@tile.SecondaryColor" stroke-width="2px" 
+                points="@((int)TileSize),0 @((int)(TileSize*0.5)),@((int)(TileSize*-0.87)) @((int)(TileSize*-0.50)),@((int)(TileSize*-0.87)) @((int)-TileSize),0 @((int)(TileSize*-0.50)),@((int)(TileSize*0.87)) @((int)(TileSize*0.50)),@((int)(TileSize*0.87))"
+            ></polygon>
+            @*<text fill="#AAAAAA" font-size="10" x="-50" y="-70">(@tile.Q, @tile.R) (@tile.X, @tile.Y)</text>*@
+            @if (tile.Unit != null)
+            {
+                @((MarkupString)tile.Unit.Content())
+            }
+            @if(tile.Unit is IHasGold hasGold)
+            {
+                <g><text fill="#FFD700" stroke="#000000" stroke-width="1px" font-size="20" text-anchor="middle" y="60">@((int)(hasGold.Gold)) 💰</text></g>
+            }
+        </g>
+    }
+    @if (dragElement != null)
+    {
+        <g transform="translate(@mousePosition.X, @mousePosition.Y)" style="cursor:none">
+            @((MarkupString)dragElement.Content())
+        </g>
+    }
+</svg>
+
+@code {
+    const double TileSize = 75;
+    const int TicksPerSecond = 10;
+    const double GoldRateMultiplier = 0.1;
+
+    private struct AxialCoords
+    {
+        public double Q;
+        public double R;
+
+        public AxialCoords(double q, double r)
+        {
+            Q = q;
+            R = r;
+        }
+
+        public static implicit operator AxialCoords((double Q, double R) coords) => new AxialCoords(coords.Q, coords.R);
+        public static implicit operator (double Q, double R)(AxialCoords coords) => (coords.Q, coords.R);
+
+        public Point ToPoint() => new Point((int)Math.Round(Q), (int)Math.Round(R));
+    }
+
+    private struct Point
+    {
+        public int X;
+        public int Y;
+
+        public Point(int x, int y)
+        {
+            X = x;
+            Y = y;
+        }
+
+        public static implicit operator Point((int X, int Y) coords) => new Point(coords.X, coords.Y);
+        public static implicit operator (int X, int Y)(Point coords) => (coords.X, coords.Y);
+    }
+
+    private interface IUnit
+    {
+        Tile Location { get; }
+        int Strength();
+        double CostPerTick();
+        string Content();
+        void OnTick();
+    }
+
+    private interface ICanMove
+    {
+        bool CanMoveThere(Tile target);
+        void MoveTo(Tile target);
+        int Cooldown();
+    }
+
+    private interface IHasGold
+    {
+        double Gold { get; }
+        void AddGold(double plus);
+    }
+
+    private interface ICanSpawn
+    {
+        bool CanSpawn();
+        IUnit? SpawnUnit();
+    }
+
+    private interface ISpawnable
+    {
+        void AbortSpawn();
+    }
+
+    private abstract class BaseUnit : IUnit
+    {
+        public BaseUnit(Tile location)
+        {
+            Location = location;
+        }
+        public Tile Location { get; protected set; }
+        public int PlayerId => Location?.PlayerId ?? -1;
+        public abstract int Strength();
+        public abstract double CostPerTick();
+        public abstract string Content();
+        public virtual void OnTick() {}
+    }
+
+    private class HomeUnit: BaseUnit, IHasGold, ICanSpawn
+    {
+        public HomeUnit(Tile location) : base(location)
+        {
+        }
+
+        public override double CostPerTick() => 0;
+
+        public override string Content() => $"<image href=\"house.svg\" x=\"{(int)(-TileSize / 2)}\" y=\"{(int)(-TileSize / 2)}\" width=\"{(int)(TileSize)}\" height=\"{(int)(TileSize)}\" />";
+
+        public override int Strength() => 1;
+
+        public double Gold { get; private set; } = 0;
+
+        public void AddGold(double plus)
+        {
+            Gold += plus;
+            if (Gold < 0)
+            {
+                KillAllUnits();
+                Gold = 0;
+            }
+        }
+
+        private void KillAllUnits()
+        {
+            foreach (var tile in Location.GetArea())
+            {
+                if (tile.Unit?.CostPerTick() > 0)
+                {
+                    tile.Unit = new GraveUnit(tile);
+                } 
+            }
+        }
+
+        public bool CanSpawn() => Gold >= 10;
+
+        public IUnit? SpawnUnit()
+        {
+            Gold -= 10;
+            return new InfantryUnit(Location);
+        }
+
+        public override void OnTick()
+        {
+            AddGold(Location.GetArea().Sum(t => 
+                {
+                    var gain = 1.0 * GoldRateMultiplier / TicksPerSecond;
+                    gain -= t.Unit?.CostPerTick() ?? 0.0;
+                    return gain;
+                }));
+        }
+    }
+
+    private class InfantryUnit: BaseUnit, ICanMove, ISpawnable
+    {
+        public InfantryUnit(Tile location) : base(location)
+        {
+            _strength = 1; 
+        }
+
+        private int _strength;
+        private const int MaxDistance = 5;
+        private const int CooldownAfterMove = 5 * TicksPerSecond;
+        private int _cooldown;
+
+        public bool CanMoveThere(Tile target)
+        {
+            if (_cooldown > 0)
+            {
+                return false;      
+            }
+            if (target == Location)
+            {
+                return false;
+            }
+            if (!(Location.Unit is HomeUnit) && Location.DistanceTo(target, t => t.PlayerId == this.PlayerId) > MaxDistance)
+            {
+                return false;
+            }
+            if (target.PlayerId == this.PlayerId)
+            {
+                return CanCombine(target.Unit);
+            }
+            return target.GetNeighbours().Append(target).All(t =>
+                {
+                    if (target.PlayerId == t.PlayerId)
+                    {
+                        return Strength() > (t.Unit?.Strength() ?? 0);
+                    }
+                    return true;
+                });
+        }
+
+        public void MoveTo(Tile target)
+        {
+            if (Location != null && Location.Unit == this)
+            {
+                Location.Unit = null;
+            }
+            if (target.PlayerId != this.PlayerId)
+            {
+                Capture(target);
+            }
+            else if (target.Unit != null)
+            {
+                Combine(target.Unit);
+            }
+            target.Unit = this;
+            Location = target;
+            _cooldown = CooldownAfterMove;
+        }
+
+        public int Cooldown()
+        {
+            return _cooldown;
+        }
+
+        public override void OnTick()
+        {
+            if (_cooldown > 0)
+            {
+                _cooldown -= 1;
+                if (_cooldown == 0)
+                {
+                    UpdateDarkArea();
+                }
+            }
+        }
+
+        private bool CanCombine(IUnit? with)
+        {
+            if (with is InfantryUnit inf) 
+            {
+                return _strength + inf.Strength() <= 4;
+            }
+            if (with is GraveUnit)
+            {
+                return true;
+            }
+            return with == null;
+        }
+
+        public void Combine(IUnit with) 
+        { 
+            _strength += with.Strength();
+        }
+
+        public override string Content()
+        {
+            var gradientId = this.GetHashCode().ToString();
+            var cooldownGradient = $"<defs>" 
+                + $"<linearGradient id=\"{gradientId}\" x1=\"0\" x2=\"0\" y1=\"0\" y2=\"1\">"
+                + $"<stop offset=\"0%\" stop-color=\"black\" stop-opacity=\"0\"/>"
+                + $"<stop offset=\"{(int)(_cooldown * 100 / CooldownAfterMove)}%\" stop-color=\"black\" stop-opacity=\"0.8\"/>"
+                + $"<stop offset=\"100%\" stop-color=\"black\"/>"
+                + $"</linearGradient>"
+                + $"</defs>";
+            var result = string.Empty;
+            var fill = "#444444";
+            if (_cooldown > 0)
+            {
+                result += cooldownGradient;
+                fill = $"url(#{gradientId})";
+            }
+
+            result += $"<text fill=\"{fill}\" font-size=\"120\" dominant-baseline=\"middle\" text-anchor=\"middle\">{Strength().ToString()}</text>";
+
+            return result;
+        }  
+
+        public override int Strength() => _strength;
+
+        private static readonly double[] UnitCostPerTick = { 2.0 * GoldRateMultiplier / TicksPerSecond, 6.0 * GoldRateMultiplier / TicksPerSecond, 18.0 * GoldRateMultiplier / TicksPerSecond, 54.0 * GoldRateMultiplier / TicksPerSecond };
+
+        public override double CostPerTick() => UnitCostPerTick[_strength - 1];
+
+        private void CombineAreas(IEnumerable<Tile> tiles)
+        {
+            var areas = new List<IEnumerable<Tile>>();
+            foreach(var tile in tiles)
+            {
+                if (areas.Any(a => a.Contains(tile)))
+                { 
+                    continue;
+                }
+                areas.Add(tile.GetArea());
+            }
+            
+            var areahomes = areas.Select(a => (a, a.Select(t => t.Unit).OfType<HomeUnit>().FirstOrDefault())).Where(e => !(e.Item2 == null)).ToList();
+            areahomes.Sort((e1, e2) => e2.a.Count() - e1.a.Count());
+            foreach (var secondary in areahomes.Skip(1))
+            {
+                if (secondary.Item2 is null)
+                {
+                    continue;
+                }
+                areahomes.First().Item2?.AddGold(secondary.Item2.Gold);
+                secondary.Item2.Location.Unit = null;
+            }
+        }
+
+        private void SplitAreas(Tile tileLeft, Tile tileCaptured)
+        {
+            var newArea = tileLeft.GetArea(t => t != tileCaptured);
+            if (newArea.Count() == 1)
+            {
+                if (newArea.First().Unit is HomeUnit)
+                {
+                    newArea.First().Unit = null;
+                }
+                return;
+            }
+            if (!newArea.Any(t => t.Unit is HomeUnit))
+            {
+                var tile = newArea.OrderBy(t => t.Unit?.Strength() ?? 0).First();
+                tile.Unit = new HomeUnit(tile);
+            }
+        }
+
+        private void Capture(Tile target)
+        {
+            CombineAreas(target.GetNeighbours().Where(t => t.PlayerId == this.PlayerId));
+
+            foreach(var neighbour in target.GetNeighbours())
+            {
+                if (neighbour.PlayerId == target.PlayerId)
+                {
+                    SplitAreas(neighbour, target);
+                }
+            }
+            target.PlayerId = this.PlayerId;
+        }
+
+        public void AbortSpawn()
+        {
+            (Location.Unit as IHasGold)?.AddGold(10);
+        }
+    }
+
+    private class GraveUnit : BaseUnit
+    {
+        public GraveUnit(Tile location) : base(location) { }
+
+        public override string Content() => $"<text fill=\"#444444\" font-size=\"120\" dominant-baseline=\"middle\" text-anchor=\"middle\">✟</text>" ;
+
+        public override double CostPerTick() => 0;
+
+        public override int Strength() => 0;
+    }
+
+    private class Tile
+    {
+        public Tile(Map map)
+        {
+            Map = map;
+        }
+
+        public Map Map { get; }
+        public int Q;
+        public int R;
+        public int PlayerId;
+        public IUnit? Unit;
+
+        public int X => (int)(TileSize * 3.0 / 2.0 * Q);
+        public int Y => (int)(TileSize * (Math.Sqrt(3.0) / 2.0 * Q + Math.Sqrt(3.0) * R));
+
+        public bool IsHighlighted = false;
+        public bool IsDarkend = false;
+
+        private static readonly string[] Colors = { "#BBFFBB", "#BBBBFF", "#FFBBBB" };
+        private static readonly string[] HighlightColors = { "#EEFFEE", "#EEEEFF", "#FFEEEE" };
+        private static readonly string[] DarkendColors = { "#557755", "#555577", "#775555" };
+        private static readonly string[] SecondaryColors = { "#88FF88", "#8888FF", "#FF8888" };
+
+        public string PrimaryColor => IsDarkend ? DarkendColors[PlayerId] : IsHighlighted ? HighlightColors[PlayerId] : Colors[PlayerId];
+        public string SecondaryColor => SecondaryColors[PlayerId];
+
+        public IEnumerable<Tile> GetNeighbours()
+        {
+            foreach (var tile in Map.Tiles)
+            {
+                if (tile.Q == this.Q)
+                {
+                    if (Math.Abs(tile.R - this.R) == 1)
+                    {
+                        yield return tile;
+                    }
+                }
+                else if (tile.Q == this.Q + 1)
+                {
+                    if (tile.R == this.R || tile.R == this.R - 1)
+                    {
+                        yield return tile;
+                    }
+                }
+                else if (tile.Q == this.Q - 1)
+                {
+                    if (tile.R == this.R || tile.R == this.R + 1)
+                    {
+                        yield return tile;
+                    }
+                }
+            }
+        }
+
+        public IEnumerable<Tile> GetArea()
+        {
+            return GetArea(_ => true);
+        }
+
+        public IEnumerable<Tile> GetArea(Func<Tile, bool> canVisit)
+        {
+            yield return this;
+            var visited = new List<Tile>();
+            var fringe = new List<Tile>();
+            var newFringe = new List<Tile>();
+            fringe.Add(this);
+            do {
+                newFringe.Clear();
+                foreach (var tile in fringe)
+                {
+                    foreach (var n in tile.GetNeighbours())
+                    {
+                        if (visited.Contains(n) || fringe.Contains(n) || newFringe.Contains(n))
+                        {
+                            continue;
+                        }
+                        if (n.PlayerId != PlayerId || !canVisit(n))
+                        {
+                            continue;
+                        }
+                        newFringe.Add(n);
+                        yield return n;
+                    }
+                    visited.Add(tile);
+                }
+                fringe.Clear();
+                fringe.AddRange(newFringe);
+            } while (newFringe.Any());
+        }
+
+        public int DistanceTo(Tile target, Func<Tile, bool> canVisit)
+        {
+            if (target == this)
+            {
+                return 0;
+            }
+            var distance = 0;
+            var visited = new List<Tile>();
+            var fringe = new List<Tile>();
+            var newFringe = new List<Tile>();
+            fringe.Add(this);
+            do {
+                distance++;
+                newFringe.Clear();
+                foreach (var tile in fringe)
+                {
+                    foreach (var n in tile.GetNeighbours())
+                    {
+                        if (visited.Contains(n) || fringe.Contains(n))
+                        {
+                            continue;
+                        }
+                        if (n == target)
+                        {
+                            return distance;
+                        }
+                        if (!canVisit(n))
+                        {
+                            continue;
+                        }
+                        newFringe.Add(n);
+                    }
+                    visited.Add(tile);
+                }
+                fringe.Clear();
+                fringe.AddRange(newFringe);
+            } while (newFringe.Any());
+            return int.MaxValue;
+        }
+    }
+
+    private static Random rng = new Random();  
+
+    private class Map 
+    {
+        public List<Tile> Tiles = new List<Tile>();
+
+        public void Add(Tile tile) => Tiles.Add(tile);
+
+        public void AddHomes()
+        {
+            foreach (var tile in Tiles.Where(t => t.GetNeighbours().Any(n => n.PlayerId == t.PlayerId)).OrderBy(e => rng.Next()))
+            {
+                if (tile.GetArea().Where(t => t.PlayerId == tile.PlayerId).Any(t => t.Unit is HomeUnit))
+                {
+                    continue;
+                }
+                var newHome  = new HomeUnit(tile);
+                newHome.AddGold(10);
+                tile.Unit = newHome;
+            }
+        }
+
+        public void GenerateRandom(int minX, int maxX, int minY, int maxY)
+        {
+            for (var q = 0; q < 10; q++)
+            {
+                for (var r = -10; r < 10; r++)
+                {
+                    var tile = new Tile(this) 
+                    { 
+                        Q = q, 
+                        R = r, 
+                        PlayerId = rng.Next(0,3) 
+                    };
+
+                    if (tile.X > minX && tile.X < maxX && tile.Y > minY && tile.Y < maxY)
+                    {
+                        this.Add(tile);
+                    }
+                }
+            }
+            AddHomes();
+        }
+    }
+
+    private static Map _map = new Map();
+
+    private Timer _gameUpdateTimer = new Timer();
+
+    private Point mousePosition;
+
+    ElementReference MapReference;
+
+    private static IUnit? dragElement;
+
+    protected override Task OnInitializedAsync()
+    {
+        _map.GenerateRandom(0, 1000, 0, 1000);
+        _gameUpdateTimer.AutoReset = true;
+        _gameUpdateTimer.Interval = 1000 / TicksPerSecond;
+        _gameUpdateTimer.Elapsed += GameTick;
+        _gameUpdateTimer.Enabled = true;
+        return base.OnInitializedAsync();
+    }
+
+    private void GameTick(object? sender, ElapsedEventArgs e)
+    {
+        foreach (var tile in _map.Tiles)
+        {
+            tile.Unit?.OnTick();
+        }
+        InvokeAsync(() => this.StateHasChanged());
+    }
+
+    private void MapMouseDown(MouseEventArgs e, Tile mapEntry)
+    {
+        if (mapEntry.Unit is ICanMove)
+        {
+            dragElement = mapEntry.Unit;
+        }
+        if (mapEntry.Unit is ICanSpawn canSpawn)
+        {
+            dragElement = canSpawn.SpawnUnit();
+        }
+        if (dragElement == null)
+        {
+            return;
+        }
+        UpdateDarkArea();
+    }
+
+    public static void UpdateDarkArea()
+    {
+        foreach(var tile in _map.Tiles)
+        {
+            tile.IsDarkend = (dragElement is ICanMove canMove) && !canMove.CanMoveThere(tile);
+        }
+    }
+
+    private async Task MouseMove(MouseEventArgs e)
+    {
+        var rect = await MapReference.GetClientRectAsync();
+
+        mousePosition.X = (int)(e.ClientX - rect.Left);
+        mousePosition.Y = (int)(e.ClientY - rect.Top);
+
+        foreach (var tile in _map.Tiles)
+        {
+            tile.IsHighlighted = false;
+        }
+        var mouseOvertile = TileFromPosition(mousePosition.X, mousePosition.Y);
+        if (mouseOvertile != null)
+        {
+            mouseOvertile.IsHighlighted = true;
+        }
+    }
+
+    private (double X, double Y, double Z) AxialToCube(AxialCoords axialCoords)
+    {
+        return (axialCoords.Q, axialCoords.R, -axialCoords.Q - axialCoords.R);
+    }
+
+    private AxialCoords CubeToAxial((double X, double Y, double Z) cubeCoords)
+    {
+        return (cubeCoords.X, cubeCoords.Y);
+    }
+
+    private (double X, double Y, double Z) CubeRound((double X, double Y, double Z) cubeCoords)
+    {
+        var rx = Math.Round(cubeCoords.X);
+        var ry = Math.Round(cubeCoords.Y);
+        var rz = Math.Round(cubeCoords.Z);
+
+        var x_diff = Math.Abs(rx - cubeCoords.X);
+        var y_diff = Math.Abs(ry - cubeCoords.Y);
+        var z_diff = Math.Abs(rz - cubeCoords.Z);
+
+        if (x_diff > y_diff && x_diff > z_diff)
+        {
+            rx = -ry - rz;
+        }
+        else if (y_diff > z_diff)
+        {
+            ry = -rx - rz;
+        }
+        else
+        {
+            rz = -rx - ry;
+        }
+
+        return (rx, ry, rz);
+    }
+
+    private (int Q, int R) PixelToHex(int x, int y)
+    {
+        var qfrac = (double)x * 2.0 / 3.0 / TileSize;
+        var rfrac = ((double)x / -3.0 + Math.Sqrt(3.0) / 3.0 * (double)y) / TileSize;
+        return CubeToAxial(CubeRound(AxialToCube((qfrac, rfrac)))).ToPoint();
+    }
+
+    private Tile? TileFromPosition(int x, int y)
+    {
+        var hexCoords = PixelToHex(x, y);
+        foreach (var tile in _map.Tiles)
+        {
+            if (tile.Q == hexCoords.Q && tile.R == hexCoords.R)
+            {
+                return tile;
+            }
+        }
+        return null;
+    }
+
+    private void MouseUp(MouseEventArgs e)
+    {
+        if (dragElement == null)
+        {
+            return;
+        }
+        foreach(var t in _map.Tiles) 
+        { 
+            t.IsDarkend = false; 
+        }
+
+        var tile = TileFromPosition(mousePosition.X, mousePosition.Y);
+        if (tile != null && dragElement is ICanMove canMove && canMove.CanMoveThere(tile))
+        {
+            canMove.MoveTo(tile);
+        }
+        else
+        {
+            (dragElement as ISpawnable)?.AbortSpawn();
+        }
+        dragElement = null;
+    }
+}
