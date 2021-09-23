@@ -20,8 +20,6 @@ jobs:
     - name: Publish .NET Core Project
       run: dotnet publish SRT.csproj -c Release -o release --nologo
     - name: Commit wwwroot to GitHub Pages
-      uses: JamesIves/github-pages-deploy-action@3.7.1
+      uses: avinal/github-pages-deploy-action@v0.9
       with:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        BRANCH: gh-pages
-        FOLDER: release/wwwroot
+        DOCS_FOLDER: release/wwwroot
