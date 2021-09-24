@@ -596,7 +596,8 @@
 
     private async Task MouseMove(MouseEventArgs e)
     {
-        var rect = await MapReference.GetClientRectAsync();
+        DomRect? rect = null;
+        await InvokeAsync(async () => rect = await MapReference.GetClientRectAsync());
 
         mousePosition.X = (int)(e.ClientX - rect.Left);
         mousePosition.Y = (int)(e.ClientY - rect.Top);
